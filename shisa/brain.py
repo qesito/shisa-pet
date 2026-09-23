@@ -1,24 +1,31 @@
-"""Config, memory and the Claude API connection."""
+"""Config, memory and talking to Claude (through Claude Code or the API)."""
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
-
-import anthropic
+import uuid
+from pathlib import Path
 
 from .paths import CONFIG_DIR, DATA_DIR
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 KEY_FILE = CONFIG_DIR / "api_key"
 HISTORY_FILE = DATA_DIR / "history.json"
+SESSION_FILE = DATA_DIR / "claude_session.json"
+CLAUDE_CODE_DIR = DATA_DIR / "claude-code"   # working dir for Shisa's Claude Code sessions
 
 DEFAULTS = {
-    "model": "claude-opus-5",
-    "effort": "low",          # low | medium | high — chat doesn't need deep thinking
-    "size": 1.0,              # pet scale
-    "wander": True,           # hop around the bottom of the screen now and then
-    "sleep_after": 300,       # seconds without attention before napping
-    "history_messages": 40,   # how much past chat is sent with each message
+    "backend": "claude-code",   # "claude-code" (your Claude plan) or "api" (API key)
+    "claude_code_model": None,  # e.g. "haiku" or "sonnet"; None = Claude Code's default
+    "model": "claude-opus-5",   # used by the "api" backend
+    "effort": "low",            # low | medium | high — chat doesn't need deep thinking
+    "size": 1.0,                # pet scale
+    "wander": True,             # hop around the bottom of the screen now and then
+    "sleep_after": 300,         # seconds without attention before napping
+    "history_messages": 40,     # how much past chat is sent with each message
 }
 
 MOODS = {"happy", "excited", "love", "surprised", "sad", "sleepy", "thinking", "neutral"}
@@ -46,12 +53,16 @@ _TAG = re.compile(r"^\s*\[(\w+)\]\s*")
 def load_config():
     cfg = dict(DEFAULTS)
     try:
-        cfg.update(json.loads(CONFIG_FILE.read_text()))
+        user = json.loads(CONFIG_FILE.read_text())
     except FileNotFoundError:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(DEFAULTS, indent=2) + "\n")
+        user = {}
     except (OSError, ValueError) as e:
         print(f"shisa: ignoring bad config ({e})")
+        return cfg
+    cfg.update(user)
+    if set(DEFAULTS) - set(user):   # write new options into the file so they're discoverable
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
     return cfg
 
 
@@ -137,6 +148,7 @@ class Brain:
         with self.lock:
             self.history = []
             self._save_history()
+            self._new_session()
 
     def _context(self):
         msgs = self.history[-int(self.cfg["history_messages"]):]
@@ -146,11 +158,8 @@ class Brain:
 
     # --- talking -----------------------------------------------------------
 
-    def _client(self):
-        if self.client is None:
-            key = os.environ.get("ANTHROPIC_API_KEY") or saved_key()
-            self.client = anthropic.Anthropic(api_key=key)
-        return self.client
+    def needs_key(self):
+        return self.cfg["backend"] == "api" and not has_key()
 
     def reset_client(self):
         self.client = None
@@ -164,59 +173,156 @@ class Brain:
         threading.Thread(target=self._ask, args=(text, emit), daemon=True).start()
 
     def _ask(self, text, emit):
+        split = _MoodSplitter()
+        reply = []
+
         def show(mood, chunk):
             if mood:
                 emit("mood", mood if mood in MOODS else "neutral")
             if chunk:
                 emit("delta", chunk)
 
+        def on_text(chunk):
+            reply.append(chunk)
+            show(*split.feed(chunk))
+
         with self.lock:
             self.history.append({"role": "user", "content": text})
-            split = _MoodSplitter()
-            reply = ""
-            error = None
             try:
-                extra = {}
-                if self.cfg.get("effort"):
-                    extra["output_config"] = {"effort": self.cfg["effort"]}
-                with self._client().messages.stream(
-                    model=self.cfg["model"],
-                    max_tokens=16000,
-                    system=SYSTEM,
-                    messages=self._context(),
-                    **extra,
-                    # If a safety classifier declines, let the API retry on its
-                    # recommended fallback model instead of just refusing.
-                    extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
-                    extra_body={"fallbacks": "default"},
-                ) as stream:
-                    for chunk in stream.text_stream:
-                        reply += chunk
-                        show(*split.feed(chunk))
-                    final = stream.get_final_message()
-                show(*split.flush())
-                if final.stop_reason == "refusal":
-                    error = "refusal"
-            except anthropic.AuthenticationError:
-                error = "auth"
-            except anthropic.PermissionDeniedError:
-                error = "permission"
-            except anthropic.NotFoundError:
-                error = "model"
-            except anthropic.RateLimitError:
-                error = "ratelimit"
-            except anthropic.APIStatusError as e:
-                msg = str(getattr(e, "message", e))
-                error = "credit" if "credit balance" in msg.lower() else f"api:{msg}"
-            except anthropic.APIConnectionError:
-                error = "offline"
+                if self.cfg["backend"] == "api":
+                    error = self._via_api(on_text)
+                else:
+                    error = self._via_claude_code(text, on_text)
             except Exception as e:  # never leave the pet stuck "thinking"
                 error = f"api:{e}"
-
             if error:
                 self.history.pop()
                 emit("error", error)
                 return
-            self.history.append({"role": "assistant", "content": reply.strip() or "[neutral] ..."})
+            show(*split.flush())
+            self.history.append({"role": "assistant",
+                                 "content": "".join(reply).strip() or "[neutral] ..."})
             self._save_history()
             emit("done", None)
+
+    # --- backend: Claude Code (uses your Claude plan, no API key) ----------
+
+    def _claude_exe(self):
+        for exe in (self.cfg.get("claude_path"), shutil.which("claude"),
+                    str(Path.home() / ".local" / "bin" / "claude")):
+            if exe and os.access(exe, os.X_OK):
+                return exe
+        return None
+
+    def _session(self):
+        try:
+            data = json.loads(SESSION_FILE.read_text())
+            return data["id"], not data.get("started")
+        except (OSError, ValueError, KeyError):
+            return self._new_session(), True
+
+    def _new_session(self, started=False, sid=None):
+        sid = sid or str(uuid.uuid4())
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(json.dumps({"id": sid, "started": started}))
+        return sid
+
+    def _via_claude_code(self, text, on_text, retry=True):
+        exe = self._claude_exe()
+        if not exe:
+            return "noclaude"
+        sid, fresh = self._session()
+        cmd = [exe, "-p", "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--system-prompt", SYSTEM,
+               # chat only: no tools, so Shisa can't run commands or touch files
+               "--tools", "", "--strict-mcp-config"]
+        cmd += ["--session-id", sid] if fresh else ["--resume", sid]
+        if self.cfg.get("effort"):
+            cmd += ["--effort", self.cfg["effort"]]
+        if self.cfg.get("claude_code_model"):
+            cmd += ["--model", self.cfg["claude_code_model"]]
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+        CLAUDE_CODE_DIR.mkdir(parents=True, exist_ok=True)
+
+        result, got_text = None, False
+        with tempfile.TemporaryFile("w+") as errf:
+            proc = subprocess.Popen(cmd, cwd=CLAUDE_CODE_DIR, env=env, text=True,
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf)
+            proc.stdin.write(text)     # via stdin so a message starting with "-" isn't a flag
+            proc.stdin.close()
+            for line in proc.stdout:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "stream_event":
+                    ev = d.get("event", {})
+                    delta = ev.get("delta", {})
+                    if ev.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                        got_text = True
+                        on_text(delta["text"])
+                elif d.get("type") == "result":
+                    result = d
+            proc.wait()
+            errf.seek(0)
+            stderr = errf.read().strip()
+
+        if result and not result.get("is_error"):
+            if not got_text and result.get("result"):
+                on_text(result["result"])
+            if fresh:
+                self._new_session(started=True, sid=sid)
+            return None
+
+        msg = str((result or {}).get("result") or stderr or f"claude exited with {proc.returncode}")
+        low = msg.lower()
+        if retry and not fresh and not got_text and ("session" in low or "conversation" in low):
+            self._new_session()          # the old session is gone; start a fresh one
+            return self._via_claude_code(text, on_text, retry=False)
+        if "log in" in low or "login" in low or "not logged" in low or "authenticat" in low:
+            return "login"
+        if "limit" in low:
+            return "cclimit"
+        return f"api:{msg[:300]}"
+
+    # --- backend: Claude API (needs an API key) ----------------------------
+
+    def _via_api(self, on_text):
+        import anthropic
+
+        if self.client is None:
+            key = os.environ.get("ANTHROPIC_API_KEY") or saved_key()
+            self.client = anthropic.Anthropic(api_key=key)
+        extra = {}
+        if self.cfg.get("effort"):
+            extra["output_config"] = {"effort": self.cfg["effort"]}
+        try:
+            with self.client.messages.stream(
+                model=self.cfg["model"],
+                max_tokens=16000,
+                system=SYSTEM,
+                messages=self._context(),
+                **extra,
+                # If a safety classifier declines, let the API retry on its
+                # recommended fallback model instead of just refusing.
+                extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+                extra_body={"fallbacks": "default"},
+            ) as stream:
+                for chunk in stream.text_stream:
+                    on_text(chunk)
+                final = stream.get_final_message()
+            return "refusal" if final.stop_reason == "refusal" else None
+        except anthropic.AuthenticationError:
+            return "auth"
+        except anthropic.PermissionDeniedError:
+            return "permission"
+        except anthropic.NotFoundError:
+            return "model"
+        except anthropic.RateLimitError:
+            return "ratelimit"
+        except anthropic.APIStatusError as e:
+            msg = str(getattr(e, "message", e))
+            return "credit" if "credit balance" in msg.lower() else f"api:{msg}"
+        except anthropic.APIConnectionError:
+            return "offline"

@@ -1,4 +1,4 @@
-"""The desktop pet window and its chat bubble."""
+"""The desktop pet window, its chat bubble and the pop-up terminal."""
 import math
 import os
 import random
@@ -14,7 +14,7 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from . import sprite  # noqa: E402
-from .brain import Brain, has_key, load_config, save_key, strip_mood  # noqa: E402
+from .brain import Brain, load_config, save_key, strip_mood  # noqa: E402
 
 WM_CLASS = "Shisa-pet"
 FPS = 30
@@ -50,20 +50,25 @@ ERRORS = {
     "credit": "My API account is out of credits. Add some at console.anthropic.com → Billing.",
     "offline": "I can't reach the internet right now...",
     "refusal": "Hmm, I can't help with that one. Ask me something else?",
+    "noclaude": "I can't find Claude Code (the claude command). Install it, or set "
+                "\"claude_path\" in my config.json.",
+    "login": "Claude Code isn't logged in. Right-click me → Open terminal, and log in there.",
+    "cclimit": "We've hit your Claude plan's usage limit... let's chat again a bit later!",
 }
 
 
 def setup_bspwm():
-    """Float both windows above everything, on every desktop, without borders."""
+    """Float the chat bubble above everything, on every desktop, without a border.
+
+    Shisa itself is an unmanaged window, so bspwm leaves it alone.
+    """
     if not shutil.which("bspc"):
         return
-    rules = (("shisa", "focus=off"), ("shisa-chat", "focus=on"))
-    for inst, focus in rules:
-        target = f"{WM_CLASS}:{inst}"
-        subprocess.run(["bspc", "rule", "-r", target], stderr=subprocess.DEVNULL)
-        subprocess.run(["bspc", "rule", "-a", target, "state=floating", "sticky=on",
-                        "layer=above", "border=off", "manage=on", focus],
-                       stderr=subprocess.DEVNULL)
+    for inst in ("shisa", "shisa-chat"):   # drop rules from earlier runs
+        subprocess.run(["bspc", "rule", "-r", f"{WM_CLASS}:{inst}:*"], stderr=subprocess.DEVNULL)
+    subprocess.run(["bspc", "rule", "-a", f"{WM_CLASS}:shisa-chat", "state=floating",
+                    "sticky=on", "layer=above", "border=off", "focus=on"],
+                   stderr=subprocess.DEVNULL)
 
 
 def _transparent(win):
@@ -81,22 +86,18 @@ def _workarea(win):
 
 
 class Pet(Gtk.Window):
+    # A POPUP (override-redirect) window: the window manager doesn't manage it,
+    # so it can't grab Shisa's clicks, dim it or move it around. Shisa moves
+    # itself and re-raises itself now and then to stay on top.
     def __init__(self, cfg, brain):
-        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        super().__init__(type=Gtk.WindowType.POPUP)
         self.cfg, self.brain = cfg, brain
         self.k = float(cfg["size"])
         self.w, self.h = int(sprite.W * self.k), int(sprite.H * self.k)
 
         self.set_wmclass("shisa", WM_CLASS)
         self.set_title("Shisa")
-        self.set_decorated(False)
         self.set_resizable(False)
-        self.set_keep_above(True)
-        self.set_skip_taskbar_hint(True)
-        self.set_skip_pager_hint(True)
-        self.set_accept_focus(False)
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.stick()
         _transparent(self)
         self.set_size_request(self.w, self.h)
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -122,6 +123,7 @@ class Pet(Gtk.Window):
         self.hops = []                 # queued (dx, height, duration)
         self.hop = None                # current hop state
         self.next_wander = now + random.uniform(25, 60)
+        self.next_raise = now + 2
         self.particles = []
         self.next_particle = 0.0
         self.press = None              # (root_x, root_y, win_x, win_y)
@@ -182,7 +184,9 @@ class Pet(Gtk.Window):
         wander.connect("toggled", lambda w: self.cfg.__setitem__("wander", w.get_active()))
         menu.append(wander)
         menu.append(Gtk.SeparatorMenuItem())
-        item("🔑  Set API key…", lambda: self.chat.open(key_mode=True))
+        item("🖥  Open terminal", self.open_terminal)
+        if self.cfg["backend"] == "api":
+            item("🔑  Set API key…", lambda: self.chat.open(key_mode=True))
         item("🧹  Forget our chats", self.forget)
         menu.append(Gtk.SeparatorMenuItem())
         item("🙈  Hide", self.toggle_hidden)
@@ -214,6 +218,38 @@ class Pet(Gtk.Window):
             self.touch()
             self.set_mood("happy", 2)
         return True   # keeps the SIGUSR1 handler installed
+
+    def open_terminal(self):
+        """Pop a small floating terminal next to Shisa running Claude Code."""
+        w, h = int(760 * self.k), int(460 * self.k)
+        wa = _workarea(self)
+        px, py = self.pos
+        x = px - w - 10 if px - w - 10 >= wa.x else px + self.w + 10
+        x = max(wa.x, min(x, wa.x + wa.width - w))
+        y = max(wa.y + 10, min(py + self.h - h, wa.y + wa.height - h))
+        if shutil.which("bspc"):
+            subprocess.run(["bspc", "rule", "-a", "Shisa-term", "-o", "state=floating",
+                            f"rectangle={w}x{h}+{x}+{y}"], stderr=subprocess.DEVNULL)
+        claude = self.brain._claude_exe()
+        # run Claude Code, then leave a normal shell open when it exits
+        inner = f'"{claude}"; exec "${{SHELL:-sh}}"' if claude else 'exec "${SHELL:-sh}"'
+        if shutil.which("kitty"):
+            cmd = ["kitty", "--class", "Shisa-term", "--title", "Shisa terminal",
+                   "--directory", os.path.expanduser("~"), "sh", "-c", inner]
+        else:
+            cmd = ["x-terminal-emulator", "-e", "sh", "-c", inner]
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+        try:
+            subprocess.Popen(cmd, cwd=os.path.expanduser("~"), env=env, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.set_mood("sad", 3)
+            return
+        self.touch()
+        self.set_mood("excited", 2.5)
+        for _ in range(3):
+            self.spawn("sparkle")
 
     def pat(self):
         self.touch()
@@ -358,6 +394,10 @@ class Pet(Gtk.Window):
                 and not self.hops and not self.chat.get_visible() and now > self.next_wander):
             self._plan_wander()
         self._step_hop(now)
+
+        if now > self.next_raise and not self.menu.get_visible() and not self.press:
+            self.get_window().raise_()
+            self.next_raise = now + 2
 
         self.particles = [p for p in self.particles if now - p["t"] < p["life"]]
         self.queue_draw()
@@ -642,7 +682,7 @@ class ChatBubble(Gtk.Window):
                 self._add(m["content"], "me")
             else:
                 self._add(strip_mood(m["content"]), "pet")
-        if not has_key():
+        if self.pet.brain.needs_key():
             self._key_prompt()
         elif not self.pet.brain.history:
             self._add("Haisai! I'm Shisa. Type something and I'll answer~", "pet")
@@ -726,7 +766,7 @@ class ChatBubble(Gtk.Window):
                     self.current.set_text(msg)
                 else:
                     self._add(msg, "note")
-                if value == "auth":
+                if value == "auth" and self.pet.cfg["backend"] == "api":
                     self.key_mode = True
             self.busy = False
             self.current = None

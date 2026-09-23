@@ -26,13 +26,22 @@ cd shisa-pet
 shisa-pet
 ```
 
-### API key
+### How Shisa talks
 
-Shisa talks through the [Claude API](https://console.anthropic.com), which is
-separate from a Claude.ai subscription and billed per use. Create a key under
-**API Keys**, add some credit under **Billing**, then click Shisa and paste the key
-into the bubble. It's saved to `~/.config/shisa-pet/api_key` (readable only by you).
-Setting `ANTHROPIC_API_KEY` in your environment works too.
+By default Shisa chats through [Claude Code](https://claude.com/claude-code), using
+the Claude account you're already logged into. There's no API key, and replies count
+against your normal Claude plan's usage limits. Shisa runs Claude Code with **all
+tools turned off**, so it can chat but can't run commands or touch your files. Its
+conversations live in their own folder (`~/.local/share/shisa-pet/claude-code`), so
+they don't mix with your coding sessions.
+
+You need the `claude` command installed and logged in. Run `claude` once in a
+terminal to log in if you haven't yet.
+
+**Prefer the API instead?** Set `"backend": "api"` in the config, restart Shisa,
+and paste a key from [console.anthropic.com](https://console.anthropic.com) into the
+bubble. It's billed per use and saved to `~/.config/shisa-pet/api_key`, readable only
+by you. Setting `ANTHROPIC_API_KEY` works too.
 
 ## Playing with Shisa
 
@@ -41,7 +50,8 @@ Setting `ANTHROPIC_API_KEY` in your environment works too.
 | Left-click | Opens or closes the chat bubble |
 | Drag | Picks Shisa up (it flails a bit) |
 | Rub the cursor back and forth over it | Gets petted, hearts |
-| Right-click | Menu: chat, pat, nap, wander, set key, forget chats, hide, quit |
+| Right-click | Menu: chat, pat, nap, wander, open terminal, forget chats, hide, quit |
+| Right-click → Open terminal | Pops up a small floating terminal next to Shisa running full Claude Code, for real work |
 | Leave it alone for a while | Falls asleep (click to wake) |
 | Esc in the bubble | Closes the bubble |
 | `shisa-pet --toggle` | Hides Shisa, or brings it back (starts it if it isn't running) |
@@ -70,6 +80,8 @@ one Shisa runs at a time, so it's safe if that script runs again:
 
 ```json
 {
+  "backend": "claude-code",
+  "claude_code_model": null,
   "model": "claude-opus-5",
   "effort": "low",
   "size": 1.0,
@@ -79,24 +91,33 @@ one Shisa runs at a time, so it's safe if that script runs again:
 }
 ```
 
-- `model`: any Claude model ID. Cheaper options are `claude-sonnet-5` and
+- `backend`: `"claude-code"` (your Claude plan, no key) or `"api"` (API key).
+- `claude_code_model`: model for the Claude Code backend, such as `"haiku"` or
+  `"sonnet"`. A lighter model uses less of your plan. `null` uses Claude Code's
+  default.
+- `claude_path`: optional full path to `claude`, if it isn't on your `PATH`.
+- `model`: model for the API backend, any Claude model ID. Cheaper options are `claude-sonnet-5` and
   `claude-haiku-4-5`. With Haiku, also set `effort` to `null`, since Haiku doesn't
   support the effort setting.
 - `effort`: how hard the model thinks (`low`, `medium`, `high`). `low` is plenty
   for chatting.
 - `size`: scale of the pet (for example `0.8` or `1.5`).
 - `sleep_after`: seconds without attention before Shisa takes a nap.
-- `history_messages`: how many past messages Shisa remembers when replying.
+- `history_messages`: how many past messages the API backend sends with each reply.
+  The Claude Code backend resumes its own session instead.
 
 Chats are kept in `~/.local/share/shisa-pet/history.json`. Use "Forget our chats"
 in the right-click menu to wipe them.
 
 ## Window manager notes
 
-Both windows use the WM class `Shisa-pet` (instances `shisa` and `shisa-chat`).
-On **bspwm**, Shisa adds its own rules at startup so it floats above everything, on
-every desktop, with no border. With **picom**, exclude it from shadows, blur,
-rounded corners and inactive dimming. `install.sh` prints the lines to add.
+Shisa itself is an unmanaged (override-redirect) window, so window managers leave it
+alone. It stays on top and on every desktop by itself. The chat bubble is a normal
+window with the WM class `Shisa-pet` (instance `shisa-chat`). On **bspwm**, Shisa
+adds a rule at startup so the bubble floats above everything with no border. The
+terminal uses the class `Shisa-term` and opens with **kitty** if it's installed,
+otherwise `x-terminal-emulator`. With **picom**, exclude `Shisa-pet` from shadows,
+blur, rounded corners and inactive dimming. `install.sh` prints the lines to add.
 
 ## Credits
 
