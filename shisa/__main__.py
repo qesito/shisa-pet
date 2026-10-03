@@ -5,16 +5,21 @@ import sys
 
 from .paths import DATA_DIR
 
-USAGE = """usage: shisa-pet [--toggle]
+USAGE = """usage: shisa-pet [--toggle | --lock]
 
   (no option)  start Shisa
-  --toggle     hide or show the running Shisa (starts it if it isn't running)"""
+  --toggle     hide or show the running Shisa (starts it if it isn't running)
+  --lock       lock the screen with napping Shisa (needs i3lock-color)"""
 
 
 def run():
     args = sys.argv[1:]
     if args and args[0] in ("-h", "--help"):
         print(USAGE)
+        return
+    if args and args[0] == "--lock":
+        from .lockscreen import lock
+        lock()
         return
     if args and args[0] != "--toggle":
         sys.exit(USAGE)

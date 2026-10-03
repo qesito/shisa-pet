@@ -17,7 +17,11 @@ from . import sprite  # noqa: E402
 from .brain import Brain, load_config, save_key, strip_mood  # noqa: E402
 
 WM_CLASS = "Shisa-pet"
-FPS = 30
+FPS = 30          # while something's moving
+IDLE_FPS = 12     # just breathing and blinking
+SLEEP_FPS = 8     # napping
+# screen lockers draw a window over everything; Shisa hides while one runs
+LOCKERS = {"slock", "i3lock", "xsecurelock", "xlock", "physlock", "xscreensaver"}
 
 CSS = b"""
 #bubble, #bubble viewport, #bubble scrolledwindow { background: transparent; }
@@ -78,6 +82,27 @@ def _transparent(win):
     win.set_app_paintable(True)
 
 
+class LockWatch:
+    """Notices a screen locker running, re-reading /proc/<pid>/comm only for new pids."""
+
+    def __init__(self):
+        self.seen = {}    # pid -> is a locker
+
+    def locked(self):
+        try:
+            pids = {p for p in os.listdir("/proc") if p.isdigit()}
+        except OSError:
+            return False
+        self.seen = {p: v for p, v in self.seen.items() if p in pids}
+        for pid in pids - self.seen.keys():
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    self.seen[pid] = f.read().strip() in LOCKERS
+            except OSError:
+                self.seen[pid] = False
+        return any(self.seen.values())
+
+
 def _workarea(win):
     display = Gdk.Display.get_default()
     gdk_win = win.get_window()
@@ -130,6 +155,8 @@ class Pet(Gtk.Window):
         self.dragging = False
         self.rub = []                  # recent hover positions for petting
         self.pos = (0, 0)
+        self.fps, self.timer = 0, None
+        self.lockwatch, self.locked, self.hidden_by_lock = LockWatch(), False, None
 
         wa = Gdk.Display.get_default().get_primary_monitor() or Gdk.Display.get_default().get_monitor(0)
         wa = wa.get_workarea()
@@ -138,8 +165,9 @@ class Pet(Gtk.Window):
 
         self.chat = ChatBubble(self)
         self.menu = self._build_menu()
-        GLib.timeout_add(1000 // FPS, self.tick)
         self.queue_hop(0, 26, 0.5)     # hello hop
+        self.run_at(FPS)
+        GLib.timeout_add_seconds(1, self.check_lock)
 
     # --- setup -------------------------------------------------------------
 
@@ -196,7 +224,44 @@ class Pet(Gtk.Window):
 
     # --- reactions ---------------------------------------------------------
 
+    def run_at(self, fps):
+        """(Re)start the animation timer at `fps` frames a second; 0 stops it."""
+        if self.timer:
+            GLib.source_remove(self.timer)
+        self.timer = GLib.timeout_add(1000 // fps, self.tick) if fps else None
+        self.fps = fps
+
+    def kick(self):
+        """Something's about to move: animate at full speed right away."""
+        if self.fps != FPS and self.get_visible():
+            self.run_at(FPS)
+
+    def check_lock(self):
+        locked = self.lockwatch.locked()
+        if locked and not self.locked:
+            self.locked = True
+            # remember what was showing, then get out of the locker's way
+            self.hidden_by_lock = (self.get_visible(), self.chat.get_visible())
+            self.chat.hide()
+            self.hide()
+            self.menu.popdown()
+            self.press, self.dragging = None, False
+        elif not locked and self.locked:
+            self.locked = False
+            pet_shown, chat_shown = self.hidden_by_lock
+            if pet_shown:
+                self.move(*self.pos)
+                self.show_all()
+                self.run_at(FPS)
+                self.sleeping = True        # napped through the lock...
+                self.touch()                # ...and wakes up when you're back
+                GLib.timeout_add(500, lambda: self.set_mood("happy", 3) and False)
+            if chat_shown:
+                self.chat.open()
+        return True
+
     def touch(self):
+        self.kick()
         self.last_touch = time.monotonic()
         if self.sleeping:
             self.sleeping = False
@@ -204,6 +269,7 @@ class Pet(Gtk.Window):
             self.queue_hop(0, 20, 0.4)
 
     def set_mood(self, mood, secs=4.0):
+        self.kick()
         self.mood, self.mood_until = mood, time.monotonic() + secs
         if mood in ("happy", "excited", "love") and not self.hop and not self.hops:
             self.queue_hop(0, 14, 0.35)
@@ -212,9 +278,10 @@ class Pet(Gtk.Window):
         if self.get_visible():
             self.chat.hide()
             self.hide()
-        else:
+        elif not self.locked:
             self.move(*self.pos)
             self.show_all()
+            self.run_at(FPS)
             self.touch()
             self.set_mood("happy", 2)
         return True   # keeps the SIGUSR1 handler installed
@@ -271,8 +338,11 @@ class Pet(Gtk.Window):
 
     def queue_hop(self, dx, height, dur):
         self.hops.append((dx, height, dur))
+        self.kick()
 
     def spawn(self, kind):
+        if kind != "z":
+            self.kick()
         x = sprite.CX + random.uniform(-45, 45)
         y = sprite.BODY_CY - sprite.RY - random.uniform(0, 15)
         if kind == "z":
@@ -295,6 +365,7 @@ class Pet(Gtk.Window):
                 for _ in range(3):
                     self.spawn("sparkle")
         elif kind == "delta":
+            self.kick()
             self.thinking = False
             self.talk_until = time.monotonic() + 0.35
         else:
@@ -312,6 +383,7 @@ class Pet(Gtk.Window):
             self.menu.popup_at_pointer(e)
             return True
         if e.button == 1:
+            self.kick()
             x, y = self.get_position()
             self.press = (e.x_root, e.y_root, x, y)
             self.dragging = False
@@ -364,7 +436,8 @@ class Pet(Gtk.Window):
 
     def tick(self):
         if not self.get_visible():
-            return True
+            self.run_at(0)      # toggle_hidden / check_lock restart it
+            return False
         now = time.monotonic()
         t = now - self.t0
 
@@ -396,12 +469,28 @@ class Pet(Gtk.Window):
         self._step_hop(now)
 
         if now > self.next_raise and not self.menu.get_visible() and not self.press:
+            self.check_lock()       # never pop up over a lock screen
+            if self.locked:
+                self.run_at(0)
+                return False
             self.get_window().raise_()
             self.next_raise = now + 2
 
         self.particles = [p for p in self.particles if now - p["t"] < p["life"]]
         self.queue_draw()
+
+        fps = self._wanted_fps(now)
+        if fps != self.fps:
+            self.run_at(fps)
+            return False
         return True
+
+    def _wanted_fps(self, now):
+        if (self.hop or self.hops or self.dragging or self.thinking or now < self.talk_until
+                or (self.mood == "excited" and now < self.mood_until)
+                or any(p["kind"] != "z" for p in self.particles)):
+            return FPS
+        return SLEEP_FPS if self.sleeping else IDLE_FPS
 
     def _plan_wander(self):
         self.next_wander = time.monotonic() + random.uniform(30, 90)
@@ -750,6 +839,7 @@ class ChatBubble(Gtk.Window):
         self.current = None
         self._update_entry()
         self.pet.thinking = True
+        self.pet.kick()
         self.pet.brain.ask(text, lambda k, v: GLib.idle_add(self._on_event, k, v))
 
     def _on_event(self, kind, value):

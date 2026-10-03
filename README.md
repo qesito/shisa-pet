@@ -55,6 +55,7 @@ by you. Setting `ANTHROPIC_API_KEY` works too.
 | Leave it alone for a while | Falls asleep (click to wake) |
 | Esc in the bubble | Closes the bubble |
 | `shisa-pet --toggle` | Hides Shisa, or brings it back (starts it if it isn't running) |
+| `shisa-pet --lock` | Locks the screen with Shisa napping on a cloud (see below) |
 
 ### Hide/show shortcut
 
@@ -73,6 +74,25 @@ one Shisa runs at a time, so it's safe if that script runs again:
 ```bash
 (sleep 2; shisa-pet) &
 ```
+
+### Lock screen
+
+`shisa-pet --lock` locks the screen with [i3lock-color](https://github.com/Raymo111/i3lock-color),
+showing Shisa asleep on a cloud under a starry Aero sky, with a clock. Bind it to a key or
+hand it to xss-lock:
+
+```
+# lock the screen
+super + x
+	shisa-pet --lock
+```
+
+```bash
+xss-lock -- shisa-pet --lock &
+```
+
+While any screen locker runs (i3lock, slock, xsecurelock, ...), the pet hides and stops
+animating, then wakes up when you unlock.
 
 ## Config
 
